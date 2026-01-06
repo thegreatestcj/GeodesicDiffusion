@@ -165,7 +165,8 @@ class SimpleDiffusionPipeline(StableDiffusionPipeline):
 
 def load_pipe(device='cuda'):
     # model_id = 'CompVis/stable-diffusion-v1-4'
-    model_id = 'stabilityai/stable-diffusion-2-1-base'
+    # model_id = 'stabilityai/stable-diffusion-2-1-base' (N/A now)
+    model_id = 'runwayml/stable-diffusion-v1-5'
     # seed = 2000
     timesteps_inference = 50 #/////
     scheduler = DDIMScheduler.from_pretrained(model_id, subfolder='scheduler')

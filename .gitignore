@@ -1,0 +1,5 @@
+assets/
+results/
+tv_ckpt_sd2-1/
+*.out
+*.sh

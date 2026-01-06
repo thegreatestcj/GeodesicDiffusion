@@ -10,7 +10,7 @@ output_args:
   eta: 0.0
   out_dir: 'results/'
   output_psample: True
-  output_image_num: 17
+  output_image_num: 8
   output_start_images: False
   output_opt_points: True
   output_reconstruct_end: True
@@ -37,8 +37,17 @@ use_lerp_cond: True
 alpha: 0.002
 sphere_constraint: True
 grad_analysis_out: True 
-test_name: 'dog2dog'
-promptA: 'a cute dog'
-promptB: 'a cute dog'
-pathA: 'assets/dog17_0.png'
-pathB: 'assets/dog17_1.png'
+
+# ===========================================
+# Semantic Regularization (NEW)
+# ===========================================
+semantic_args:
+  use_semantic_reg: True
+  semantic_weight: 0.1
+  dino_model: 'dinov2_vits14'
+
+test_name: 'female'
+promptA: ''
+promptB: ''
+pathA: 'assets/female1.png'
+pathB: 'assets/female2.png'

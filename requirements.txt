@@ -8,4 +8,4 @@ scikit-learn
 git+https://github.com/patrick-kidger/torchcubicspline.git
 accelerate
 lpips
-yaml
+PyYAML
