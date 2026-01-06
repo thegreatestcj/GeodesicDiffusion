@@ -41,6 +41,7 @@ class FluxGeodesicPipeline:
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
         enable_cpu_offload: bool = True,
+        enable_xformers: bool = True,
     ):
         """
         Initialize Flux pipeline.
@@ -63,6 +64,15 @@ class FluxGeodesicPipeline:
             model_id,
             torch_dtype=dtype,
         )
+
+        # Enable xformers if requested
+        if enable_xformers:
+            try:
+                self.pipe.enable_xformers_memory_efficient_attention()
+                print("[FluxPipeline] xformers memory efficient attention enabled")
+            except Exception as e:
+                print(f"[FluxPipeline] xformers not available: {e}")
+                print("[FluxPipeline] Falling back to default attention")
         
         if enable_cpu_offload:
             # Sequential CPU offload: moves modules to GPU only when needed
@@ -518,7 +528,7 @@ class FluxGeodesicPipeline:
         return score
 
 
-def load_flux_pipe(device: str = 'cuda', enable_cpu_offload: bool = True) -> FluxGeodesicPipeline:
+def load_flux_pipe(device: str = 'cuda', enable_cpu_offload: bool = True, enable_xformers: bool = True) -> FluxGeodesicPipeline:
     """
     Load Flux pipeline with recommended settings.
     
@@ -534,5 +544,6 @@ def load_flux_pipe(device: str = 'cuda', enable_cpu_offload: bool = True) -> Flu
         device=device,
         dtype=torch.bfloat16,
         enable_cpu_offload=enable_cpu_offload,
+        enable_xformers=enable_xformers,
     )
     return pipe

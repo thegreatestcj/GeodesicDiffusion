@@ -1,8 +1,8 @@
 """
-Flux BVP Solver Entry Point
+Flux BVP Solver Entry Point with Semantic Regularization
 
 Usage:
-    python test_bvp_flux.py --c configs/config_flux.yaml
+    python test_bvp_flux.py --c configs/config_flux_semantic.yaml
 
 Requirements:
     - GPU with 24GB+ VRAM (or enable CPU offload)
@@ -24,8 +24,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 def main():
     # Parse arguments
-    parser = argparse.ArgumentParser(description='Flux BVP Solver')
-    parser.add_argument('--c', type=str, default='configs/config_flux.yaml',
+    parser = argparse.ArgumentParser(description='Flux BVP Solver with Semantic Regularization')
+    parser.add_argument('--c', type=str, default='configs/config_flux_semantic.yaml',
                         help='Path to config file')
     parser.add_argument('--device', type=str, default='cuda:0',
                         help='Device to use')
@@ -92,6 +92,15 @@ def main():
     print(f'[INFO] Image A: {config["pathA"]} ({imgA.size})')
     print(f'[INFO] Image B: {config["pathB"]} ({imgB.size})')
     
+    # Get semantic regularization args
+    semantic_args = config.get('semantic_args', {})
+    if semantic_args.get('use_semantic_reg', False):
+        print(f'[INFO] Semantic regularization enabled:')
+        print(f'       - weight: {semantic_args.get("semantic_weight", 0.1)}')
+        print(f'       - model: {semantic_args.get("dino_model", "dinov2_vits14")}')
+    else:
+        print('[INFO] Semantic regularization disabled')
+    
     # Create BVP solver
     print('[INFO] Creating BVP solver...')
     from model.bvp_flux import Geodesic_BVP_Flux
@@ -109,6 +118,7 @@ def main():
         output_args=config['output_args'],
         tv_args=config['tv_args'],
         opt_args=config['opt_args'],
+        semantic_args=semantic_args,  # Pass semantic regularization args
         use_lerp_cond=config.get('use_lerp_cond', True),
         sphere_constraint=config.get('sphere_constraint', True),
         grad_analysis_out=config.get('grad_analysis_out', True),

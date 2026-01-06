@@ -1,5 +1,6 @@
 assets/
 results/
-tv_ckpt_sd2-1/
+results_flux/
+tv_ckpt_*/
 *.out
 *.sh
