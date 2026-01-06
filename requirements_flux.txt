@@ -1,0 +1,34 @@
+# Flux-specific requirements
+# Run: pip install -r requirements_flux.txt
+
+# Base requirements (same as original)
+numpy
+pillow
+scipy
+seaborn
+scikit-learn
+accelerate
+lpips
+pyyaml
+
+# PyTorch (with CUDA support)
+torch>=2.1.0
+torchvision>=0.16.0
+
+# Diffusers with Flux support (requires recent version)
+diffusers>=0.30.0
+
+# Transformers for T5 encoder
+transformers>=4.40.0
+
+# Spline interpolation
+git+https://github.com/patrick-kidger/torchcubicspline.git
+
+# Sentencepiece for T5 tokenizer
+sentencepiece
+
+# For model downloading
+huggingface_hub>=0.23.0
+
+# Optional: for faster attention
+xformers>=0.0.23

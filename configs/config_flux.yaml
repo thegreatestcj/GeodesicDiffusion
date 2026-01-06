@@ -1,0 +1,65 @@
+# Flux BVP Configuration
+# Adapted for Flux.1-dev architecture
+
+# Gradient computation settings
+grad_args:
+  grad_sample_range: 100       # Timestep sampling range
+  grad_weight_type: 'uniform'  # Weight scheme: uniform, increase, decrease
+  grad_guidance_0: 1.0         # Positive prompt weight
+  grad_guidance_1: 1.0         # Negative prompt weight
+  grad_sample_type: 'back_n_forward_sample'
+  grad_batch_size: 2           # Smaller batch for Flux (large model)
+
+# Output settings
+output_args:
+  cfg_sample: 3.5              # CFG scale (Flux default is 3.5)
+  num_inference_steps: 8       # Flux needs fewer steps
+  out_dir: 'results_flux/'
+  output_psample: True         # Perceptually uniform sampling
+  output_image_num: 17         # Number of output frames
+  output_start_images: False
+  output_opt_points: True
+  output_reconstruct_end: True
+  output_separate_images: True
+  out_interval: -1             # -1 = only save final
+
+# Bisection sampler settings
+bisect_args:
+  max_strength: 4
+  bisect_interval: 100
+  random_end: False
+  only_new_points: False
+
+# Optimizer settings
+opt_args:
+  lr: 0.05                     # Lower LR for Flux (more sensitive)
+  iter_num: 200                # Fewer iterations (each step is slower)
+  lr_scheduler: 'linear'
+  lr_divide: True
+
+# Text inversion settings
+tv_args:
+  tv_lr: 0.003                 # Lower LR for Flux
+  tv_steps: 300                # Fewer steps
+  tv_batch_size: 1             # Smaller batch for memory
+  tv_ckpt_folder: 'tv_ckpt_flux/'
+
+# Geodesic parameters
+noise_level: 0.6               # Noise level [0, 1]
+use_lerp_cond: True            # Interpolate text embeddings
+alpha: 0.002                   # Geodesic smoothness weight
+sphere_constraint: True        # Constrain path to sphere
+grad_analysis_out: True
+
+# Test configuration
+test_name: 'dog2dog_flux'
+promptA: 'a cute dog'
+promptB: 'a cute dog'
+pathA: 'assets/dog17_0.png'
+pathB: 'assets/dog17_1.png'
+
+# Flux-specific settings
+flux_args:
+  model_id: 'black-forest-labs/FLUX.1-dev'
+  dtype: 'bfloat16'
+  enable_cpu_offload: True     # Essential for 24GB VRAM
