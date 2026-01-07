@@ -8,7 +8,7 @@ grad_args:
   grad_guidance_0: 1.0         # Positive prompt weight
   grad_guidance_1: 1.0         # Negative prompt weight
   grad_sample_type: 'back_n_forward_sample'
-  grad_batch_size: 2           # Smaller batch for Flux (large model)
+  grad_batch_size: 1           # Batch size 1 for memory efficiency on 24GB GPU
 
 # Output settings
 output_args:
@@ -26,21 +26,23 @@ output_args:
 # Bisection sampler settings
 bisect_args:
   max_strength: 4
-  bisect_interval: 100
+  bisect_interval: 25          # Lowered from 100 for faster convergence
   random_end: False
   only_new_points: False
 
 # Optimizer settings
 opt_args:
   lr: 0.05                     # Lower LR for Flux (more sensitive)
-  iter_num: 200                # Fewer iterations (each step is slower)
+  iter_num: 50                # Lowered from 200 for faster runs
   lr_scheduler: 'linear'
   lr_divide: True
 
 # Text inversion settings
+# NOTE: Set tv_steps: 0 to skip text inversion (saves memory on 24GB GPUs)
+# Text inversion with Flux requires disabling CPU offload and ~40GB VRAM
 tv_args:
   tv_lr: 0.003                 # Lower LR for Flux
-  tv_steps: 300                # Fewer steps
+  tv_steps: 0                  # Set to 0 to skip (memory-saving), or 300 for optimization
   tv_batch_size: 1             # Smaller batch for memory
   tv_ckpt_folder: 'tv_ckpt_flux/'
 
@@ -60,11 +62,11 @@ semantic_args:
   dino_model: 'dinov2_vits14'  # DINO model: dinov2_vits14, dinov2_vitb14, dinov2_vitl14
 
 # Test configuration
-test_name: 'dog2dog_flux_semantic'
-promptA: 'a cute dog'
-promptB: 'a cute dog'
-pathA: 'assets/dog17_0.png'
-pathB: 'assets/dog17_1.png'
+test_name: 'female'
+promptA: ''
+promptB: ''
+pathA: 'assets/female1.png'
+pathB: 'assets/female2.png'
 
 # Flux-specific settings
 flux_args:

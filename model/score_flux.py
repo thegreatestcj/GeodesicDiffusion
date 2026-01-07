@@ -193,36 +193,48 @@ class FluxScoreDistillation:
         grad_c = 0
         grad_d = 0
         
-        with torch.autocast(device_type='cuda', dtype=self.dtype):
-            if self.grad_guidance_0 == self.grad_guidance_1:
-                # Optimization: single forward pass difference
-                # v_cond - v_neg gives direction toward conditional distribution
-                v_cond = self.pipe.predict_velocity(
-                    latent_t, t, prompt_embeds, pooled_embeds, guidance_scale=1.0
-                )
-                v_neg = self.pipe.predict_velocity(
-                    latent_t, t, embed_neg, pooled_neg, guidance_scale=1.0
-                )
-                
-                grad_c = -v_cond
-                grad_d = v_neg
-            else:
-                # Full computation with unconditional baseline
-                v_uncond = self.pipe.predict_velocity(
-                    latent_t, t, embed_uncond, pooled_uncond, guidance_scale=1.0
-                )
-                
-                if self.grad_guidance_0 > 0:
+        with torch.no_grad():  # No gradients needed for score computation
+            with torch.autocast(device_type='cuda', dtype=self.dtype):
+                if self.grad_guidance_0 == self.grad_guidance_1:
+                    # Optimization: single forward pass difference
+                    # v_cond - v_neg gives direction toward conditional distribution
                     v_cond = self.pipe.predict_velocity(
                         latent_t, t, prompt_embeds, pooled_embeds, guidance_scale=1.0
                     )
-                    grad_c = v_uncond - v_cond  # Direction toward conditional
-                
-                if self.grad_guidance_1 > 0:
+                    grad_c = -v_cond.clone()
+                    del v_cond
+                    torch.cuda.empty_cache()
+
                     v_neg = self.pipe.predict_velocity(
                         latent_t, t, embed_neg, pooled_neg, guidance_scale=1.0
                     )
-                    grad_d = v_neg - v_uncond  # Direction away from negative
+                    grad_d = v_neg.clone()
+                    del v_neg
+                    torch.cuda.empty_cache()
+                else:
+                    # Full computation with unconditional baseline
+                    v_uncond = self.pipe.predict_velocity(
+                        latent_t, t, embed_uncond, pooled_uncond, guidance_scale=1.0
+                    )
+
+                    if self.grad_guidance_0 > 0:
+                        v_cond = self.pipe.predict_velocity(
+                            latent_t, t, prompt_embeds, pooled_embeds, guidance_scale=1.0
+                        )
+                        grad_c = v_uncond - v_cond  # Direction toward conditional
+                        del v_cond
+                        torch.cuda.empty_cache()
+
+                    if self.grad_guidance_1 > 0:
+                        v_neg = self.pipe.predict_velocity(
+                            latent_t, t, embed_neg, pooled_neg, guidance_scale=1.0
+                        )
+                        grad_d = v_neg - v_uncond  # Direction away from negative
+                        del v_neg
+                        torch.cuda.empty_cache()
+
+                    del v_uncond
+                    torch.cuda.empty_cache()
         
         # Weight and combine
         w = self.grad_weight(t).view(-1, 1, 1, 1)
@@ -314,10 +326,15 @@ class FluxTextInversion:
         from tqdm import tqdm
         import torch.nn.functional as F
         
-        print('[TextInv] Optimizing text embeddings...')
-        
         # Get initial embeddings
         prompt_embeds, pooled_embeds = self.pipe.prompt2embed(prompt)
+
+        # Skip optimization if tv_steps is 0 (memory-saving mode)
+        if self.tv_steps == 0:
+            print('[TextInv] Skipping optimization (tv_steps=0), using original embeddings')
+            return prompt_embeds, pooled_embeds
+
+        print('[TextInv] Optimizing text embeddings...')
         
         # Make copies for optimization
         prompt_embeds_opt = prompt_embeds.clone().requires_grad_(True)
@@ -332,17 +349,21 @@ class FluxTextInversion:
         if target_latent.shape[0] < self.tv_batch_size:
             target_latent = target_latent.repeat(self.tv_batch_size, 1, 1, 1)
         
+        # Enable gradient checkpointing to reduce memory usage
+        if hasattr(self.pipe.transformer, 'enable_gradient_checkpointing'):
+            self.pipe.transformer.enable_gradient_checkpointing()
+
         for i in tqdm(range(self.tv_steps), desc='TextInv'):
             optimizer.zero_grad()
-            
+
             # Sample random timesteps
             t = torch.randint(100, 900, (self.tv_batch_size,), device=self.pipe.device).float()
-            
+
             # Add noise
             noise = torch.randn_like(target_latent[:self.tv_batch_size])
             sigma = (t / 1000).view(-1, 1, 1, 1)
             noisy_latent = (1 - sigma) * target_latent[:self.tv_batch_size] + sigma * noise
-            
+
             # Predict velocity
             v_pred = self.pipe.predict_velocity(
                 noisy_latent,
@@ -351,15 +372,19 @@ class FluxTextInversion:
                 pooled_embeds_opt.expand(self.tv_batch_size, -1),
                 guidance_scale=1.0,
             )
-            
+
             # Target velocity
             v_target = noise - target_latent[:self.tv_batch_size]
-            
+
             # Loss
             loss = F.mse_loss(v_pred, v_target)
             loss.backward()
             optimizer.step()
-            
+
+            # Clear cache periodically to prevent fragmentation
+            if i % 10 == 0:
+                torch.cuda.empty_cache()
+
             if i % 100 == 0:
                 print(f'[TextInv] Step {i}, loss: {loss.item():.6f}')
         

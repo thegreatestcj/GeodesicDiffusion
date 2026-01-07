@@ -837,6 +837,26 @@ class Geodesic_BVP_Flux:
         
         return imgs
     
+    def _save_optimization_path(self):
+        """Save entire optimization path (all control points and spline data) before generating images."""
+        path_data = {
+            'control_points': {k: v.cpu() for k, v in self.path.items()},
+            'latent_shape': self.latent_shape,
+            'radius': self.radius if self.sphere_constraint else None,
+            'cur_iter': self.cur_iter,
+            'spline_t': torch.tensor(sorted(self.path.keys())),
+            'spline_X': torch.stack([self.path[k] for k in sorted(self.path.keys())], dim=0).cpu(),
+        }
+
+        # Also sample dense points along the path for visualization
+        t_dense = torch.linspace(0, 1, 101, device=self.device)
+        path_data['dense_t'] = t_dense.cpu()
+        path_data['dense_X'] = self.spline(t_dense).cpu()
+
+        save_path = os.path.join(self.io.out_dir, 'optimization_path.pt')
+        torch.save(path_data, save_path)
+        print(f'[BVP-Flux] Saved optimization path to {save_path}')
+
     def solve(self):
         """Run the full BVP optimization."""
         print('[BVP-Flux] Starting optimization...')
@@ -852,6 +872,8 @@ class Geodesic_BVP_Flux:
             finished = self.step()
             
             if finished or i == self.optimizer.iter_num - 1:
+                # Save entire optimization path (all control points) before generating images
+                self._save_optimization_path()
                 self.save_sequence('final')
                 break
             

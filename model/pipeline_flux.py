@@ -1,15 +1,17 @@
 """
 Flux Pipeline for Geodesic Computation
 
-Flux uses:
-- DiT (Diffusion Transformer) instead of UNet
-- Flow Matching instead of DDPM/DDIM
-- Dual text encoders (CLIP + T5)
-- Different latent space format
+IMPORTANT: This version dynamically adapts to the transformer's expected input format
+by checking transformer.config.in_channels at runtime.
 
-Reference: https://github.com/black-forest-labs/flux
+Different diffusers versions handle Flux packing differently:
+- Some expect raw channels (16) with internal packing
+- Some expect pre-packed channels (64) with 2x2 patches
+
+This implementation handles both cases automatically.
 """
 
+import os
 import torch
 import torch.nn as nn
 from typing import Optional, Tuple, List, Union
@@ -24,15 +26,30 @@ from transformers import CLIPTextModel, CLIPTokenizer, T5EncoderModel, T5Tokeniz
 from model.utils import load_image, output_image, load_image_batch, output_image_batch
 
 
+def setup_cache_dir(cache_dir: Optional[str] = None) -> str:
+    """Setup HuggingFace cache directory for cluster environments."""
+    if cache_dir is not None:
+        resolved_dir = cache_dir
+    elif os.environ.get('HF_HOME'):
+        resolved_dir = os.environ['HF_HOME']
+    elif os.environ.get('SCRATCH'):
+        resolved_dir = os.path.join(os.environ['SCRATCH'], 'huggingface')
+    else:
+        resolved_dir = os.path.join(os.path.expanduser('~'), '.cache', 'huggingface')
+    
+    os.makedirs(resolved_dir, exist_ok=True)
+    os.environ['HF_HOME'] = resolved_dir
+    os.environ['HUGGINGFACE_HUB_CACHE'] = os.path.join(resolved_dir, 'hub')
+    
+    return resolved_dir
+
+
 class FluxGeodesicPipeline:
     """
     Flux pipeline adapted for geodesic computation.
     
-    Key differences from SD:
-    1. Uses Flow Matching: x_t = (1-t)*x_0 + t*noise, velocity v = noise - x_0
-    2. DiT architecture instead of UNet
-    3. Different VAE (same architecture, different weights)
-    4. Dual text encoders: CLIP for local features, T5 for global understanding
+    Automatically detects the transformer's expected input format and
+    adapts packing/unpacking accordingly.
     """
     
     def __init__(
@@ -41,48 +58,33 @@ class FluxGeodesicPipeline:
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
         enable_cpu_offload: bool = True,
-        enable_xformers: bool = True,
+        cache_dir: Optional[str] = None,
     ):
-        """
-        Initialize Flux pipeline.
-        
-        Args:
-            model_id: HuggingFace model ID
-            device: Target device
-            dtype: Model precision (bf16 recommended for Flux)
-            enable_cpu_offload: Enable sequential CPU offload to save VRAM
-        """
         self.device = device
         self.dtype = dtype
         self.model_id = model_id
         
+        # Setup cache
+        resolved_cache_dir = setup_cache_dir(cache_dir)
+        print(f"[FluxPipeline] Model cache: {resolved_cache_dir}")
         print(f"[FluxPipeline] Loading {model_id}...")
-        print(f"[FluxPipeline] This may take a few minutes for first download (~30GB)")
         
-        # Load the full pipeline
+        # Load pipeline
         self.pipe = FluxPipeline.from_pretrained(
             model_id,
             torch_dtype=dtype,
+            cache_dir=os.path.join(resolved_cache_dir, 'hub'),
         )
-
-        # Enable xformers if requested
-        if enable_xformers:
-            try:
-                self.pipe.enable_xformers_memory_efficient_attention()
-                print("[FluxPipeline] xformers memory efficient attention enabled")
-            except Exception as e:
-                print(f"[FluxPipeline] xformers not available: {e}")
-                print("[FluxPipeline] Falling back to default attention")
         
         if enable_cpu_offload:
-            # Sequential CPU offload: moves modules to GPU only when needed
-            # Essential for 24GB VRAM
-            self.pipe.enable_sequential_cpu_offload()
-            print("[FluxPipeline] CPU offload enabled")
+            # Use model_cpu_offload instead of sequential_cpu_offload
+            # sequential_cpu_offload can hang on some systems
+            self.pipe.enable_model_cpu_offload()
+            print("[FluxPipeline] CPU offload enabled (model-level)")
         else:
             self.pipe.to(device)
-        
-        # Extract components for direct access
+
+        # Extract components
         self.transformer: FluxTransformer2DModel = self.pipe.transformer
         self.vae: AutoencoderKL = self.pipe.vae
         self.text_encoder: CLIPTextModel = self.pipe.text_encoder
@@ -90,26 +92,46 @@ class FluxGeodesicPipeline:
         self.tokenizer: CLIPTokenizer = self.pipe.tokenizer
         self.tokenizer_2: T5TokenizerFast = self.pipe.tokenizer_2
         self.scheduler = self.pipe.scheduler
-        
-        # Flux latent space config
-        self.vae_scale_factor = self.pipe.vae_scale_factor  # Usually 8
-        self.latent_channels = self.transformer.config.in_channels  # Usually 16 for Flux
-        
+
+        # NOTE: Gradient checkpointing is incompatible with sequential CPU offload
+        # Enable it only when needed for training (in score_flux.py)
+
+        # Get VAE latent channels
+        self.vae_scale_factor = self.pipe.vae_scale_factor  # typically 8
+        self.vae_latent_channels = self.vae.config.latent_channels  # typically 16
+
+        # CRITICAL: Detect transformer's expected input format
+        self.transformer_in_channels = self.transformer.config.in_channels
+
+        # Determine packing mode
+        if self.transformer_in_channels == self.vae_latent_channels:
+            # No packing - transformer handles it internally
+            self.packing_mode = 'none'
+            self.patch_size = 1
+        elif self.transformer_in_channels == self.vae_latent_channels * 4:
+            # 2x2 patch packing required
+            self.packing_mode = '2x2'
+            self.patch_size = 2
+        else:
+            raise ValueError(
+                f"Unexpected configuration: transformer expects {self.transformer_in_channels} channels, "
+                f"but VAE outputs {self.vae_latent_channels} channels"
+            )
+
+        print(f"[FluxPipeline] VAE latent channels: {self.vae_latent_channels}")
+        print(f"[FluxPipeline] Transformer in_channels: {self.transformer_in_channels}")
+        print(f"[FluxPipeline] Packing mode: {self.packing_mode}")
+
         # Disable gradients for inference
         self.transformer.requires_grad_(False)
         self.vae.requires_grad_(False)
         self.text_encoder.requires_grad_(False)
         self.text_encoder_2.requires_grad_(False)
         
-        # Random generator
         self.generator = torch.Generator(device="cpu")
-        
         print(f"[FluxPipeline] Loaded successfully")
-        print(f"[FluxPipeline] Latent channels: {self.latent_channels}")
-        print(f"[FluxPipeline] VAE scale factor: {self.vae_scale_factor}")
     
     def set_seed(self, seed: int):
-        """Set random seed for reproducibility."""
         self.generator = torch.Generator(device="cpu").manual_seed(seed)
     
     # =========================================================================
@@ -117,22 +139,10 @@ class FluxGeodesicPipeline:
     # =========================================================================
     
     def img2latent(self, image: Image.Image, height: int = 512, width: int = 512) -> torch.Tensor:
-        """
-        Encode image to latent space.
-        
-        Args:
-            image: PIL Image
-            height: Target height
-            width: Target width
-            
-        Returns:
-            latent: Tensor of shape [1, C, H//8, W//8]
-        """
-        # Preprocess image
+        """Encode image to latent space."""
         img_tensor = load_image(image, self.device, resize_dims=(height, width))
         img_tensor = img_tensor.to(dtype=self.dtype)
         
-        # Encode
         with torch.no_grad():
             latent_dist = self.vae.encode(img_tensor).latent_dist
             latent = latent_dist.sample() * self.vae.config.scaling_factor
@@ -140,40 +150,15 @@ class FluxGeodesicPipeline:
         return latent
     
     def latent2img(self, latent: torch.Tensor) -> Image.Image:
-        """
-        Decode latent to image.
-        
-        Args:
-            latent: Tensor of shape [1, C, H, W]
-            
-        Returns:
-            image: PIL Image
-        """
+        """Decode latent to image."""
         latent = latent.to(dtype=self.dtype)
         
         with torch.no_grad():
             latent_scaled = latent / self.vae.config.scaling_factor
             img_tensor = self.vae.decode(latent_scaled).sample
         
-        # Convert to PIL
         img = output_image(img_tensor.float())
         return img
-    
-    def img2latent_batch(self, images: List[Image.Image], height: int = 512, width: int = 512) -> torch.Tensor:
-        """Encode multiple images to latents."""
-        latents = []
-        for img in images:
-            latent = self.img2latent(img, height, width)
-            latents.append(latent)
-        return torch.cat(latents, dim=0)
-    
-    def latent2img_batch(self, latents: torch.Tensor) -> List[Image.Image]:
-        """Decode multiple latents to images."""
-        images = []
-        for i in range(latents.shape[0]):
-            img = self.latent2img(latents[i:i+1])
-            images.append(img)
-        return images
     
     # =========================================================================
     # Text Encoding
@@ -185,21 +170,9 @@ class FluxGeodesicPipeline:
         prompt_2: Optional[str] = None,
         max_sequence_length: int = 512,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Encode text prompt using dual encoders.
-        
-        Args:
-            prompt: Text prompt
-            prompt_2: Optional second prompt for T5 (defaults to prompt)
-            max_sequence_length: Max tokens for T5
-            
-        Returns:
-            prompt_embeds: CLIP embeddings [1, seq_len, hidden_dim]
-            pooled_prompt_embeds: Pooled CLIP embeddings [1, hidden_dim]
-        """
+        """Encode text prompt using dual encoders."""
         prompt_2 = prompt_2 or prompt
         
-        # Use the pipeline's encoding method
         (
             prompt_embeds,
             pooled_prompt_embeds,
@@ -214,26 +187,117 @@ class FluxGeodesicPipeline:
         return prompt_embeds, pooled_prompt_embeds
     
     def prompt2embed(self, prompt: str) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Simplified prompt encoding (compatible with SD interface).
-        
-        Returns tuple of (prompt_embeds, pooled_prompt_embeds)
-        """
+        """Simplified prompt encoding."""
         return self.encode_prompt(prompt)
     
     # =========================================================================
-    # Flow Matching Forward/Backward
+    # Dynamic Latent Packing/Unpacking
+    # =========================================================================
+    
+    def _pack_latents(self, latents: torch.Tensor) -> Tuple[torch.Tensor, dict]:
+        """
+        Pack latents for transformer based on detected packing mode.
+        
+        Returns:
+            packed_latents: Packed tensor ready for transformer
+            info: Dictionary with unpacking information (height, width, etc.)
+        """
+        batch_size, channels, height, width = latents.shape
+        
+        info = {
+            'batch_size': batch_size,
+            'channels': channels,
+            'height': height,
+            'width': width,
+        }
+        
+        if self.packing_mode == 'none':
+            # Simple flatten: [B, C, H, W] -> [B, H*W, C]
+            packed = latents.view(batch_size, channels, height * width)
+            packed = packed.permute(0, 2, 1)  # [B, H*W, C]
+            info['seq_len'] = height * width
+            
+        elif self.packing_mode == '2x2':
+            # 2x2 patch packing: [B, C, H, W] -> [B, (H/2)*(W/2), C*4]
+            packed = latents.view(
+                batch_size, channels, 
+                height // 2, 2, 
+                width // 2, 2
+            )
+            packed = packed.permute(0, 2, 4, 1, 3, 5)  # [B, H/2, W/2, C, 2, 2]
+            packed = packed.reshape(
+                batch_size, 
+                (height // 2) * (width // 2), 
+                channels * 4
+            )
+            info['seq_len'] = (height // 2) * (width // 2)
+        
+        return packed, info
+    
+    def _unpack_latents(self, latents: torch.Tensor, info: dict) -> torch.Tensor:
+        """
+        Unpack latents from transformer output back to image format.
+        """
+        batch_size = info['batch_size']
+        channels = info['channels']
+        height = info['height']
+        width = info['width']
+        
+        if self.packing_mode == 'none':
+            # [B, H*W, C] -> [B, C, H, W]
+            unpacked = latents.permute(0, 2, 1)  # [B, C, H*W]
+            unpacked = unpacked.view(batch_size, channels, height, width)
+            
+        elif self.packing_mode == '2x2':
+            # [B, (H/2)*(W/2), C*4] -> [B, C, H, W]
+            unpacked = latents.reshape(
+                batch_size,
+                height // 2, width // 2,
+                channels, 2, 2
+            )
+            unpacked = unpacked.permute(0, 3, 1, 4, 2, 5)  # [B, C, H/2, 2, W/2, 2]
+            unpacked = unpacked.reshape(batch_size, channels, height, width)
+        
+        return unpacked
+    
+    def _get_latent_image_ids(self, latents: torch.Tensor) -> torch.Tensor:
+        """
+        Generate positional IDs based on packing mode.
+        """
+        batch_size, channels, height, width = latents.shape
+        
+        if self.packing_mode == 'none':
+            # Position IDs for each pixel
+            seq_h, seq_w = height, width
+        else:
+            # Position IDs for each 2x2 patch
+            seq_h, seq_w = height // 2, width // 2
+        
+        latent_image_ids = torch.zeros(
+            seq_h, seq_w, 3,
+            device=latents.device,
+            dtype=latents.dtype
+        )
+        
+        latent_image_ids[..., 1] = torch.arange(
+            seq_h, device=latents.device, dtype=latents.dtype
+        )[:, None]
+        latent_image_ids[..., 2] = torch.arange(
+            seq_w, device=latents.device, dtype=latents.dtype
+        )[None, :]
+        
+        latent_image_ids = latent_image_ids.view(1, seq_h * seq_w, 3)
+        latent_image_ids = latent_image_ids.expand(batch_size, -1, -1)
+        
+        return latent_image_ids
+    
+    # =========================================================================
+    # Flow Matching Operations
     # =========================================================================
     
     def get_timestep(self, noise_level: float) -> torch.Tensor:
-        """
-        Convert noise level [0, 1] to Flux timestep.
-        
-        In Flow Matching: t=0 is clean, t=1 is noise
-        """
-        # Flux uses continuous timesteps in [0, 1]
-        t = torch.tensor([noise_level], device=self.device, dtype=self.dtype)
-        return t
+        """Convert noise level [0, 1] to timestep tensor."""
+        return torch.tensor([noise_level], device=self.device, dtype=self.dtype)
     
     def add_noise(
         self,
@@ -241,34 +305,9 @@ class FluxGeodesicPipeline:
         noise: torch.Tensor,
         timestep: torch.Tensor
     ) -> torch.Tensor:
-        """
-        Add noise using Flow Matching interpolation.
-        
-        x_t = (1 - t) * x_0 + t * noise
-        
-        Args:
-            latent: Clean latent x_0
-            noise: Noise tensor
-            timestep: Time in [0, 1]
-            
-        Returns:
-            noisy_latent: x_t
-        """
+        """Flow Matching noise addition: x_t = (1-t)*x_0 + t*noise"""
         t = timestep.view(-1, 1, 1, 1)
-        noisy_latent = (1 - t) * latent + t * noise
-        return noisy_latent
-    
-    def get_velocity(
-        self,
-        latent: torch.Tensor,
-        noise: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Compute ground truth velocity for Flow Matching.
-        
-        v = noise - x_0 (derivative of x_t w.r.t. t)
-        """
-        return noise - latent
+        return (1 - t) * latent + t * noise
     
     def latent_forward(
         self,
@@ -276,27 +315,13 @@ class FluxGeodesicPipeline:
         noise_level: float = 1.0,
         noise: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        """
-        Forward process: add noise to latent.
-        
-        Args:
-            latent: Clean latent
-            noise_level: Amount of noise [0, 1]
-            noise: Optional pre-generated noise
-            
-        Returns:
-            noisy_latent: Noised latent
-        """
+        """Forward process: add noise to latent."""
         if noise_level == 0:
             return latent
-        
         if noise is None:
             noise = torch.randn_like(latent)
-        
         t = self.get_timestep(noise_level)
-        noisy_latent = self.add_noise(latent, noise, t)
-        
-        return noisy_latent
+        return self.add_noise(latent, noise, t)
     
     def latent_backward(
         self,
@@ -307,62 +332,52 @@ class FluxGeodesicPipeline:
         num_inference_steps: int = 8,
         guidance_scale: float = 3.5,
     ) -> torch.Tensor:
-        """
-        Backward process: denoise latent using Flow Matching.
-        
-        Args:
-            latent: Noisy latent at noise_level
-            prompt_embeds: Text embeddings
-            pooled_prompt_embeds: Pooled text embeddings
-            noise_level: Starting noise level
-            num_inference_steps: Number of denoising steps
-            guidance_scale: CFG scale
-            
-        Returns:
-            clean_latent: Denoised latent
-        """
-        # Set up timesteps
-        self.scheduler.set_timesteps(num_inference_steps, device=self.device)
-        
-        # Find starting index based on noise_level
+        """Backward process: denoise latent."""
+        batch_size = latent.shape[0]
+
+        # Get image sequence length for dynamic shifting (required by FlowMatchEulerDiscreteScheduler)
+        _, channels, height, width = latent.shape
+        if self.packing_mode == '2x2':
+            seq_len = (height // 2) * (width // 2)
+        else:
+            seq_len = height * width
+
+        # Compute mu for dynamic shifting if the scheduler requires it
+        scheduler_kwargs = {"device": self.device}
+        if getattr(self.scheduler.config, 'use_dynamic_shifting', False):
+            # Flux uses image_seq_len to compute mu internally
+            scheduler_kwargs["mu"] = self.pipe.scheduler.config.base_shift + (
+                self.pipe.scheduler.config.max_shift - self.pipe.scheduler.config.base_shift
+            ) * (seq_len / (seq_len + 1))
+
+        self.scheduler.set_timesteps(num_inference_steps, **scheduler_kwargs)
         timesteps = self.scheduler.timesteps
+        
         start_idx = int((1 - noise_level) * len(timesteps))
         timesteps = timesteps[start_idx:]
         
-        # Prepare latent
         latent = latent.to(dtype=self.dtype)
         
-        # Get text IDs (required by Flux)
-        batch_size = latent.shape[0]
-        text_ids = torch.zeros(batch_size, prompt_embeds.shape[1], 3, device=self.device)
-        
-        # Get latent image IDs
+        # Get position IDs
+        text_ids = torch.zeros(
+            batch_size, prompt_embeds.shape[1], 3, 
+            device=self.device, dtype=self.dtype
+        )
         latent_image_ids = self._get_latent_image_ids(latent)
         
-        # Denoising loop
-        for i, t in enumerate(tqdm(timesteps, desc="Denoising")):
-            # Expand timestep for batch
+        for t in tqdm(timesteps, desc="Denoising"):
             timestep = t.expand(batch_size)
             
-            # Predict velocity
-            velocity_pred = self._predict_velocity(
-                latent,
-                timestep,
-                prompt_embeds,
-                pooled_prompt_embeds,
-                text_ids,
-                latent_image_ids,
-                guidance_scale,
+            velocity_pred = self._predict_velocity_internal(
+                latent, timestep, prompt_embeds, pooled_prompt_embeds,
+                text_ids, latent_image_ids, guidance_scale,
             )
             
-            # Step
-            latent = self.scheduler.step(
-                velocity_pred, t, latent, return_dict=False
-            )[0]
+            latent = self.scheduler.step(velocity_pred, t, latent, return_dict=False)[0]
         
         return latent
     
-    def _predict_velocity(
+    def _predict_velocity_internal(
         self,
         latent: torch.Tensor,
         timestep: torch.Tensor,
@@ -373,83 +388,38 @@ class FluxGeodesicPipeline:
         guidance_scale: float = 3.5,
     ) -> torch.Tensor:
         """
-        Predict velocity using the transformer.
-        
-        Uses classifier-free guidance if guidance_scale > 1.
+        Internal velocity prediction with pre-computed IDs.
         """
         batch_size = latent.shape[0]
-        
-        # Pack latents to Flux format
-        latent_packed = self._pack_latents(latent)
-        
+
+        # Pack latents (keeping original dtype to preserve gradients if needed)
+        latent_packed, pack_info = self._pack_latents(latent)
+
         # Expand embeddings for batch
         if prompt_embeds.shape[0] != batch_size:
             prompt_embeds = prompt_embeds.expand(batch_size, -1, -1)
             pooled_prompt_embeds = pooled_prompt_embeds.expand(batch_size, -1)
-        
-        # Forward through transformer
-        with torch.no_grad():
+
+        # Use autocast for mixed precision - this preserves gradients while handling dtype
+        with torch.autocast(device_type='cuda', dtype=self.dtype):
             velocity_pred = self.transformer(
                 hidden_states=latent_packed,
-                timestep=timestep / 1000,  # Flux expects normalized timestep
+                timestep=timestep / 1000,  # Normalize to [0, 1]
                 encoder_hidden_states=prompt_embeds,
                 pooled_projections=pooled_prompt_embeds,
-                txt_ids=text_ids,
-                img_ids=latent_image_ids,
+                txt_ids=text_ids.squeeze(0) if text_ids.dim() == 3 else text_ids,
+                img_ids=latent_image_ids.squeeze(0) if latent_image_ids.dim() == 3 else latent_image_ids,
                 guidance=torch.tensor([guidance_scale], device=self.device, dtype=self.dtype),
                 return_dict=False,
             )[0]
-        
-        # Unpack
-        velocity_pred = self._unpack_latents(velocity_pred, latent.shape)
-        
+
+        # Unpack back to image format
+        velocity_pred = self._unpack_latents(velocity_pred, pack_info)
+
         return velocity_pred
     
-    def _pack_latents(self, latents: torch.Tensor) -> torch.Tensor:
-        """
-        Pack latents to Flux transformer format.
-        
-        Flux expects: [B, (H*W), C] where patches are flattened
-        """
-        batch_size, channels, height, width = latents.shape
-        
-        # Reshape to sequence format
-        latents = latents.view(batch_size, channels, height * width)
-        latents = latents.permute(0, 2, 1)  # [B, H*W, C]
-        
-        return latents
-    
-    def _unpack_latents(self, latents: torch.Tensor, target_shape: Tuple) -> torch.Tensor:
-        """
-        Unpack latents from Flux transformer format.
-        """
-        batch_size, seq_len, channels = latents.shape
-        height = width = int(seq_len ** 0.5)
-        
-        latents = latents.permute(0, 2, 1)  # [B, C, H*W]
-        latents = latents.view(batch_size, channels, height, width)
-        
-        return latents
-    
-    def _get_latent_image_ids(self, latents: torch.Tensor) -> torch.Tensor:
-        """
-        Generate positional IDs for latent patches.
-        """
-        batch_size, channels, height, width = latents.shape
-        
-        # Create grid of positions
-        latent_image_ids = torch.zeros(height, width, 3, device=self.device, dtype=self.dtype)
-        latent_image_ids[..., 1] = torch.arange(height, device=self.device)[:, None]
-        latent_image_ids[..., 2] = torch.arange(width, device=self.device)[None, :]
-        
-        # Flatten and expand for batch
-        latent_image_ids = latent_image_ids.view(1, height * width, 3)
-        latent_image_ids = latent_image_ids.expand(batch_size, -1, -1)
-        
-        return latent_image_ids
-    
     # =========================================================================
-    # Score/Velocity Prediction for Geodesics
+    # Public Velocity Prediction API (for geodesic computation)
     # =========================================================================
     
     def predict_velocity(
@@ -461,38 +431,26 @@ class FluxGeodesicPipeline:
         guidance_scale: float = 1.0,
     ) -> torch.Tensor:
         """
-        Predict velocity at given timestep (for geodesic computation).
+        Predict velocity at given timestep.
         
-        Args:
-            latent: Latent tensor [B, C, H, W]
-            timestep: Scalar or tensor timestep in [0, 1000]
-            prompt_embeds: Text embeddings
-            pooled_prompt_embeds: Pooled embeddings
-            guidance_scale: CFG scale
-            
-        Returns:
-            velocity: Predicted velocity [B, C, H, W]
+        This is the main API for geodesic computation.
         """
         batch_size = latent.shape[0]
         
-        # Convert timestep
         if isinstance(timestep, float):
-            timestep = torch.tensor([timestep], device=self.device)
-        timestep = timestep.expand(batch_size)
+            timestep = torch.tensor([timestep], device=self.device, dtype=self.dtype)
+        timestep = timestep.expand(batch_size).to(dtype=self.dtype)
         
-        # Get IDs
-        text_ids = torch.zeros(batch_size, prompt_embeds.shape[1], 3, device=self.device)
+        # Compute IDs
+        text_ids = torch.zeros(
+            batch_size, prompt_embeds.shape[1], 3,
+            device=self.device, dtype=self.dtype
+        )
         latent_image_ids = self._get_latent_image_ids(latent)
         
-        # Predict
-        velocity = self._predict_velocity(
-            latent,
-            timestep,
-            prompt_embeds,
-            pooled_prompt_embeds,
-            text_ids,
-            latent_image_ids,
-            guidance_scale,
+        velocity = self._predict_velocity_internal(
+            latent, timestep, prompt_embeds, pooled_prompt_embeds,
+            text_ids, latent_image_ids, guidance_scale,
         )
         
         return velocity
@@ -502,48 +460,23 @@ class FluxGeodesicPipeline:
         velocity: torch.Tensor,
         timestep: Union[float, torch.Tensor],
     ) -> torch.Tensor:
-        """
-        Convert velocity prediction to score (gradient of log probability).
-        
-        In Flow Matching:
-        - x_t = (1-t)*x_0 + t*ε
-        - v = dx_t/dt = ε - x_0
-        - score ≈ -v / σ(t) where σ(t) = t (for linear interpolation)
-        
-        Args:
-            velocity: Predicted velocity
-            timestep: Current timestep
-            
-        Returns:
-            score: Approximated score function
-        """
+        """Convert velocity to score: score ≈ -v/σ(t)"""
         if isinstance(timestep, float):
             timestep = torch.tensor([timestep], device=self.device)
-        
-        # For Flow Matching with linear interpolation
-        # σ(t) = t, so score ≈ -velocity / t
         sigma = timestep.view(-1, 1, 1, 1).clamp(min=1e-5)
-        score = -velocity / sigma
-        
-        return score
+        return -velocity / sigma
 
 
-def load_flux_pipe(device: str = 'cuda', enable_cpu_offload: bool = True, enable_xformers: bool = True) -> FluxGeodesicPipeline:
-    """
-    Load Flux pipeline with recommended settings.
-    
-    Args:
-        device: Target device
-        enable_cpu_offload: Enable CPU offload for VRAM saving
-        
-    Returns:
-        pipe: FluxGeodesicPipeline instance
-    """
-    pipe = FluxGeodesicPipeline(
+def load_flux_pipe(
+    device: str = 'cuda',
+    enable_cpu_offload: bool = True,
+    cache_dir: Optional[str] = None,
+) -> FluxGeodesicPipeline:
+    """Load Flux pipeline with recommended settings."""
+    return FluxGeodesicPipeline(
         model_id="black-forest-labs/FLUX.1-dev",
         device=device,
         dtype=torch.bfloat16,
         enable_cpu_offload=enable_cpu_offload,
-        enable_xformers=enable_xformers,
+        cache_dir=cache_dir,
     )
-    return pipe
