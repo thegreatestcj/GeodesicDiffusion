@@ -67,8 +67,8 @@ semantic_args:
 test_name: 'ld1'
 promptA: ''
 promptB: ''
-pathA: 'assets/art1-1.jpg'
-pathB: 'assets/art1-2.jpg'
+pathA: 'assets/ld1-1.jpg'
+pathB: 'assets/ld1-2.jpg'
 
 # Flux-specific settings
 flux_args:

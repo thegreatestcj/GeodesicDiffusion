@@ -830,6 +830,14 @@ class Geodesic_BVP_Flux:
     def save_sequence(self, name: str):
         """Save current path as image sequence."""
         print(f'[BVP-Flux] Saving sequence: {name}')
+
+        print(f'[DEBUG] output_reconstruct_end = {self.io.output_reconstruct_end}')
+        print(f'[DEBUG] imgA is None: {self.imgA is None}')
+        print(f'[DEBUG] imgB is None: {self.imgB is None}')
+        if self.imgA:
+            print(f'[DEBUG] imgA size: {self.imgA.size}')
+        if self.imgB:
+            print(f'[DEBUG] imgB size: {self.imgB.size}')
         
         # Sample points along path
         t_out = self.io.out_t

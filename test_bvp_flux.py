@@ -12,6 +12,7 @@ Requirements:
 
 import os
 import sys
+from wandb import config
 import yaml
 import shutil
 import argparse
@@ -50,6 +51,9 @@ def main():
     print(f'[INFO] Loading config: {args.c}')
     with open(args.c, 'r') as f:
         config = yaml.safe_load(f)
+
+    config['output_args']['output_reconstruct_end'] = False
+    print(f"DEBUG: output_reconstruct_end = {config['output_args']['output_reconstruct_end']}")
     
     # Setup output directory
     out_dir = config['output_args']['out_dir']
