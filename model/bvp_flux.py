@@ -304,6 +304,9 @@ class FluxBVPIO:
         prompt_embeds: torch.Tensor,
         pooled_embeds: torch.Tensor,
     ) -> Image.Image:
+        print(f'[DEBUG latent] shape={lat.shape}')
+        print(f'[DEBUG latent] min={lat.min().item():.3f}, max={lat.max().item():.3f}')
+        print(f'[DEBUG latent] mean={lat.mean().item():.3f}, std={lat.std().item():.3f}')
         """Backward process: noised latent to image."""
         if self.noise_level > 0:
             lat = self.pipe.latent_backward(
@@ -759,8 +762,8 @@ class Geodesic_BVP_Flux:
         )
         
         # Heuristic: skip if acceleration term dominates probability term
-        if g1_n < g2_n:
-            return None, g_n, g_angle
+        # if g1_n < g2_n:
+        #     return None, g_n, g_angle
         
         return grad, g_n, g_angle
     

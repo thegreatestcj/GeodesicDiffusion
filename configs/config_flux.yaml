@@ -47,10 +47,10 @@ tv_args:
   tv_ckpt_folder: 'tv_ckpt_flux/'
 
 # Geodesic parameters
-noise_level: 0.6               # Noise level [0, 1]
+noise_level: 0.3               # Noise level [0, 1]
 use_lerp_cond: True            # Interpolate text embeddings
 alpha: 0.002                   # Geodesic smoothness weight
-sphere_constraint: True        # Constrain path to sphere
+sphere_constraint: False        # Constrain path to sphere
 grad_analysis_out: True
 
 # ===========================================
@@ -64,11 +64,11 @@ semantic_args:
   dino_model: 'dinov2_vits14'  # DINO model: dinov2_vits14, dinov2_vitb14, dinov2_vitl14
 
 # Test configuration
-test_name: 'ld1'
+test_name: 'ld2'
 promptA: ''
 promptB: ''
-pathA: 'assets/ld1-1.jpg'
-pathB: 'assets/ld1-2.jpg'
+pathA: 'assets/ld2-1.jpeg'
+pathB: 'assets/ld2-2.jpg'
 
 # Flux-specific settings
 flux_args:
