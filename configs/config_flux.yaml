@@ -16,7 +16,7 @@ output_args:
   num_inference_steps: 8       # Flux needs fewer steps
   out_dir: 'results_flux/'
   output_psample: True         # Perceptually uniform sampling
-  output_image_num: 17         # Number of output frames
+  output_image_num: 9         # Number of output frames
   output_start_images: False
   output_opt_points: True
   output_reconstruct_end: True
@@ -26,14 +26,14 @@ output_args:
 # Bisection sampler settings
 bisect_args:
   max_strength: 4
-  bisect_interval: 25          # Lowered from 100 for faster convergence
+  bisect_interval: 20          # Lowered from 100 for faster convergence
   random_end: False
   only_new_points: False
 
 # Optimizer settings
 opt_args:
   lr: 0.05                     # Lower LR for Flux (more sensitive)
-  iter_num: 50                # Lowered from 200 for faster runs
+  iter_num: 40                # Lowered from 200 for faster runs
   lr_scheduler: 'linear'
   lr_divide: True
 
@@ -56,20 +56,23 @@ grad_analysis_out: True
 # ===========================================
 # Semantic Regularization (NEW)
 # ===========================================
+# NOTE: Disabled for 24GB GPUs - DINO model + VAE decoding adds ~3-4GB overhead
+# Enable only if you have 32GB+ VRAM or are using smaller images
 semantic_args:
-  use_semantic_reg: True       # Enable DINO-v2 semantic regularization
+  use_semantic_reg: False      # Disabled for memory - enable on 32GB+ GPUs
   semantic_weight: 0.1         # Weight for semantic consistency term
   dino_model: 'dinov2_vits14'  # DINO model: dinov2_vits14, dinov2_vitb14, dinov2_vitl14
 
 # Test configuration
-test_name: 'female'
+test_name: 'ld1'
 promptA: ''
 promptB: ''
-pathA: 'assets/female1.png'
-pathB: 'assets/female2.png'
+pathA: 'assets/art1-1.jpg'
+pathB: 'assets/art1-2.jpg'
 
 # Flux-specific settings
 flux_args:
   model_id: 'black-forest-labs/FLUX.1-dev'
   dtype: 'bfloat16'
   enable_cpu_offload: True     # Essential for 24GB VRAM
+  disable_text_encoder: True   # Disable text encoders to save ~10GB VRAM (uses null embeddings)

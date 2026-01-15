@@ -59,23 +59,37 @@ class FluxGeodesicPipeline:
         dtype: torch.dtype = torch.bfloat16,
         enable_cpu_offload: bool = True,
         cache_dir: Optional[str] = None,
+        disable_text_encoder: bool = False,
     ):
         self.device = device
         self.dtype = dtype
         self.model_id = model_id
-        
+        self.disable_text_encoder = disable_text_encoder
+
         # Setup cache
         resolved_cache_dir = setup_cache_dir(cache_dir)
         print(f"[FluxPipeline] Model cache: {resolved_cache_dir}")
         print(f"[FluxPipeline] Loading {model_id}...")
-        
-        # Load pipeline
-        self.pipe = FluxPipeline.from_pretrained(
-            model_id,
-            torch_dtype=dtype,
-            cache_dir=os.path.join(resolved_cache_dir, 'hub'),
-        )
-        
+
+        # Load pipeline - skip text encoders if disabled to save memory
+        if disable_text_encoder:
+            print("[FluxPipeline] Text encoders DISABLED - using null embeddings")
+            self.pipe = FluxPipeline.from_pretrained(
+                model_id,
+                torch_dtype=dtype,
+                cache_dir=os.path.join(resolved_cache_dir, 'hub'),
+                text_encoder=None,
+                text_encoder_2=None,
+                tokenizer=None,
+                tokenizer_2=None,
+            )
+        else:
+            self.pipe = FluxPipeline.from_pretrained(
+                model_id,
+                torch_dtype=dtype,
+                cache_dir=os.path.join(resolved_cache_dir, 'hub'),
+            )
+
         if enable_cpu_offload:
             # Use model_cpu_offload instead of sequential_cpu_offload
             # sequential_cpu_offload can hang on some systems
@@ -84,13 +98,22 @@ class FluxGeodesicPipeline:
         else:
             self.pipe.to(device)
 
+        # Enable memory-efficient attention if available
+        try:
+            self.pipe.enable_xformers_memory_efficient_attention()
+            print("[FluxPipeline] xFormers memory-efficient attention enabled")
+        except Exception:
+            # xFormers not available - Flux uses PyTorch SDPA by default
+            # Note: Do NOT use AttnProcessor2_0 with Flux - it's incompatible with FluxAttention
+            print("[FluxPipeline] Using default Flux attention (PyTorch SDPA)")
+
         # Extract components
         self.transformer: FluxTransformer2DModel = self.pipe.transformer
         self.vae: AutoencoderKL = self.pipe.vae
-        self.text_encoder: CLIPTextModel = self.pipe.text_encoder
-        self.text_encoder_2: T5EncoderModel = self.pipe.text_encoder_2
-        self.tokenizer: CLIPTokenizer = self.pipe.tokenizer
-        self.tokenizer_2: T5TokenizerFast = self.pipe.tokenizer_2
+        self.text_encoder: CLIPTextModel = self.pipe.text_encoder if not disable_text_encoder else None
+        self.text_encoder_2: T5EncoderModel = self.pipe.text_encoder_2 if not disable_text_encoder else None
+        self.tokenizer: CLIPTokenizer = self.pipe.tokenizer if not disable_text_encoder else None
+        self.tokenizer_2: T5TokenizerFast = self.pipe.tokenizer_2 if not disable_text_encoder else None
         self.scheduler = self.pipe.scheduler
 
         # NOTE: Gradient checkpointing is incompatible with sequential CPU offload
@@ -125,8 +148,14 @@ class FluxGeodesicPipeline:
         # Disable gradients for inference
         self.transformer.requires_grad_(False)
         self.vae.requires_grad_(False)
-        self.text_encoder.requires_grad_(False)
-        self.text_encoder_2.requires_grad_(False)
+        if self.text_encoder is not None:
+            self.text_encoder.requires_grad_(False)
+        if self.text_encoder_2 is not None:
+            self.text_encoder_2.requires_grad_(False)
+
+        # Cache null embeddings if text encoder is disabled
+        self._null_prompt_embeds = None
+        self._null_pooled_embeds = None
         
         self.generator = torch.Generator(device="cpu")
         print(f"[FluxPipeline] Loaded successfully")
@@ -138,15 +167,67 @@ class FluxGeodesicPipeline:
     # VAE Encoding/Decoding
     # =========================================================================
     
-    def img2latent(self, image: Image.Image, height: int = 512, width: int = 512) -> torch.Tensor:
-        """Encode image to latent space."""
+    def img2latent(
+        self,
+        image: Image.Image,
+        height: int = None,
+        width: int = None,
+        max_size: int = None,
+        min_size: int = None,
+    ) -> torch.Tensor:
+        """
+        Encode image to latent space.
+
+        Args:
+            image: PIL Image to encode
+            height: Target height (if None, uses image height rounded to nearest 16)
+            width: Target width (if None, uses image width rounded to nearest 16)
+            max_size: Maximum dimension (if None, no limit - adaptive to input)
+            min_size: Minimum dimension (if None, no limit - adaptive to input)
+
+        Returns:
+            Latent tensor of shape [1, C, H//8, W//8]
+        """
+        # Get image dimensions
+        img_width, img_height = image.size
+
+        # Use provided dimensions or adapt from image
+        if height is None:
+            height = img_height
+        if width is None:
+            width = img_width
+
+        # Round to nearest multiple of 16 (VAE requires multiple of 8, and Flux packing may require 16)
+        height = ((height + 15) // 16) * 16
+        width = ((width + 15) // 16) * 16
+
+        # Apply max_size constraint if specified
+        if max_size is not None and (height > max_size or width > max_size):
+            # Scale down while preserving aspect ratio
+            scale = min(max_size / height, max_size / width)
+            height = int(height * scale)
+            width = int(width * scale)
+            # Re-round after scaling
+            height = ((height + 15) // 16) * 16
+            width = ((width + 15) // 16) * 16
+
+        # Apply min_size constraint if specified
+        if min_size is not None and (height < min_size or width < min_size):
+            # Scale up while preserving aspect ratio
+            scale = max(min_size / height, min_size / width)
+            height = int(height * scale)
+            width = int(width * scale)
+            # Re-round after scaling
+            height = ((height + 15) // 16) * 16
+            width = ((width + 15) // 16) * 16
+
         img_tensor = load_image(image, self.device, resize_dims=(height, width))
         img_tensor = img_tensor.to(dtype=self.dtype)
-        
+
         with torch.no_grad():
             latent_dist = self.vae.encode(img_tensor).latent_dist
             latent = latent_dist.sample() * self.vae.config.scaling_factor
-        
+
         return latent
     
     def latent2img(self, latent: torch.Tensor) -> Image.Image:
@@ -164,6 +245,33 @@ class FluxGeodesicPipeline:
     # Text Encoding
     # =========================================================================
     
+    def _get_null_embeddings(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Get cached null embeddings for text-encoder-disabled mode.
+
+        These are zeros with the correct shapes for Flux transformer.
+        """
+        if self._null_prompt_embeds is None:
+            # Flux transformer expects:
+            # - prompt_embeds: [batch, seq_len, hidden_size] - T5 output (4096 dim)
+            # - pooled_embeds: [batch, pooled_dim] - CLIP pooled (768 dim)
+            # Using minimal sequence length to save memory
+            seq_len = 1  # Minimal sequence
+            t5_hidden = 4096  # T5-XXL hidden size
+            clip_pooled = 768  # CLIP pooled size
+
+            self._null_prompt_embeds = torch.zeros(
+                1, seq_len, t5_hidden,
+                device=self.device, dtype=self.dtype
+            )
+            self._null_pooled_embeds = torch.zeros(
+                1, clip_pooled,
+                device=self.device, dtype=self.dtype
+            )
+            print(f"[FluxPipeline] Created null embeddings: prompt={self._null_prompt_embeds.shape}, pooled={self._null_pooled_embeds.shape}")
+
+        return self._null_prompt_embeds, self._null_pooled_embeds
+
     def encode_prompt(
         self,
         prompt: str,
@@ -171,8 +279,12 @@ class FluxGeodesicPipeline:
         max_sequence_length: int = 512,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Encode text prompt using dual encoders."""
+        # Return null embeddings if text encoder is disabled
+        if self.disable_text_encoder:
+            return self._get_null_embeddings()
+
         prompt_2 = prompt_2 or prompt
-        
+
         (
             prompt_embeds,
             pooled_prompt_embeds,
@@ -183,9 +295,9 @@ class FluxGeodesicPipeline:
             device=self.device,
             max_sequence_length=max_sequence_length,
         )
-        
+
         return prompt_embeds, pooled_prompt_embeds
-    
+
     def prompt2embed(self, prompt: str) -> Tuple[torch.Tensor, torch.Tensor]:
         """Simplified prompt encoding."""
         return self.encode_prompt(prompt)
@@ -471,12 +583,21 @@ def load_flux_pipe(
     device: str = 'cuda',
     enable_cpu_offload: bool = True,
     cache_dir: Optional[str] = None,
+    disable_text_encoder: bool = False,
 ) -> FluxGeodesicPipeline:
-    """Load Flux pipeline with recommended settings."""
+    """Load Flux pipeline with recommended settings.
+
+    Args:
+        device: Torch device ('cuda' or 'cpu')
+        enable_cpu_offload: Enable CPU offload for memory efficiency
+        cache_dir: HuggingFace cache directory
+        disable_text_encoder: If True, skip loading text encoders to save ~10GB VRAM
+    """
     return FluxGeodesicPipeline(
         model_id="black-forest-labs/FLUX.1-dev",
         device=device,
         dtype=torch.bfloat16,
         enable_cpu_offload=enable_cpu_offload,
         cache_dir=cache_dir,
+        disable_text_encoder=disable_text_encoder,
     )

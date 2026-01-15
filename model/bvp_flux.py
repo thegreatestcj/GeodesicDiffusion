@@ -10,6 +10,7 @@ Based on: "Probability Density Geodesics in Image Diffusion Latent Space"
 """
 
 import os
+import time
 import torch
 import torch.nn.functional as F
 from typing import Optional, Dict, Tuple, List
@@ -548,10 +549,31 @@ class Geodesic_BVP_Flux:
     def _initialize(self):
         """Initialize embeddings and starting path."""
         print('[BVP-Flux] Initializing...')
-        
-        # Encode images to latents
-        latA0 = self.pipe.img2latent(self.imgA)
-        latB0 = self.pipe.img2latent(self.imgB)
+
+        # Determine target resolution from input images
+        # Use the max dimensions to preserve detail, rounded to multiple of 16
+        widthA, heightA = self.imgA.size
+        widthB, heightB = self.imgB.size
+
+        # Use max of both images to ensure we don't lose detail
+        target_height = max(heightA, heightB)
+        target_width = max(widthA, widthB)
+
+        # Round to nearest multiple of 16
+        target_height = ((target_height + 15) // 16) * 16
+        target_width = ((target_width + 15) // 16) * 16
+
+        # Store for later use
+        self.target_height = target_height
+        self.target_width = target_width
+
+        print(f'[BVP-Flux] Input A: {widthA}x{heightA}, Input B: {widthB}x{heightB}')
+        print(f'[BVP-Flux] Target resolution: {target_width}x{target_height}')
+
+        # Encode images to latents with consistent dimensions
+        # Resolution is adaptive - no forced max/min size constraints
+        latA0 = self.pipe.img2latent(self.imgA, height=target_height, width=target_width)
+        latB0 = self.pipe.img2latent(self.imgB, height=target_height, width=target_width)
         
         # Get latent dimensions
         self.latent_shape = latA0.shape[1:]  # (C, H, W) without batch
@@ -745,22 +767,25 @@ class Geodesic_BVP_Flux:
     def step(self) -> bool:
         """
         Perform one optimization step.
-        
+
         Returns:
             finished: True if optimization is complete
         """
+        # Aggressive cleanup before each step
+        torch.cuda.empty_cache()
+
         # Get control points to optimize
         t_opt = self.bisect_sampler.get_control_t()
         if t_opt is None:
             return True
-        
+
         t_opt = t_opt.to(self.device)
-        
+
         # Get position, velocity, acceleration from spline
         X_opt = self.spline(t_opt)
         V_opt = self.spline(t_opt, 1)
         A_opt = self.spline(t_opt, 2)
-        
+
         # Compute gradient
         grad, g_n, g_angle = self.bvp_gradient(X_opt, V_opt, A_opt, t_opt)
         
@@ -862,34 +887,44 @@ class Geodesic_BVP_Flux:
         print('[BVP-Flux] Starting optimization...')
         if self.use_semantic_reg:
             print(f'[BVP-Flux] Semantic regularization weight: {self.semantic_weight}')
-        
+
         # Save initial path
         if self.io.output_start_images:
             self.save_sequence('start')
-        
+
+        # Start timing inference (optimization + final generation)
+        torch.cuda.synchronize()
+        inference_start = time.time()
+
         # Optimization loop
         for i in range(self.optimizer.iter_num):
             finished = self.step()
-            
+
             if finished or i == self.optimizer.iter_num - 1:
                 # Save entire optimization path (all control points) before generating images
                 self._save_optimization_path()
                 self.save_sequence('final')
                 break
-            
+
             # Periodic output
             if self.io.out_interval > 0 and self.cur_iter % self.io.out_interval == 0:
                 self.save_sequence(str(self.cur_iter))
-            
+
             # Clear cache
             torch.cuda.empty_cache()
-        
+
+        # End timing inference
+        torch.cuda.synchronize()
+        inference_end = time.time()
+        total_inference_time = inference_end - inference_start
+
         # Save optimization points
         if self.io.output_opt_points:
             torch.save(self.path, os.path.join(self.io.out_dir, 'opt_points.pth'))
-        
+
         # Save final velocities
         ts = torch.linspace(0, 1, 17, device=self.device)
         torch.save(self.spline(ts, 1), os.path.join(self.io.out_dir, 'final_vs.pt'))
-        
+
         print('[BVP-Flux] Optimization complete')
+        print(f'[BVP-Flux] Total inference time: {total_inference_time:.2f}s')

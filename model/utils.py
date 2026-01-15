@@ -38,8 +38,13 @@ def output_image_batch(imgs):
     img_list = [Image.fromarray(img) for img in imgs]
     return img_list
 
-def display_alongside(img_list, resize_dims=(512,512), padding=10, frame_color=(255, 255, 255)):
+def display_alongside(img_list, resize_dims=None, padding=10, frame_color=(255, 255, 255)):
     # take a list of PIL images and return a single image with all of them displayed alongside each other
+    # if resize_dims is None, use the size of the first image
+    if resize_dims is None and len(img_list) > 0:
+        resize_dims = img_list[0].size  # (width, height)
+    elif resize_dims is None:
+        resize_dims = (512, 512)
     padded_width = resize_dims[0] + 2 * padding
     padded_height = resize_dims[1] + 2 * padding
     res = Image.new("RGB", (padded_width * len(img_list), padded_height), frame_color)
@@ -50,15 +55,20 @@ def display_alongside(img_list, resize_dims=(512,512), padding=10, frame_color=(
         res.paste(img_resized, (x_offset, y_offset))
     return res
 
-def display_in_two_rows(img_list, resize_dims=(512,512), padding=5, frame_color=(255, 255, 255)):
+def display_in_two_rows(img_list, resize_dims=None, padding=5, frame_color=(255, 255, 255)):
     # Number of images in each row
+    # if resize_dims is None, use the size of the first image
+    if resize_dims is None and len(img_list) > 0:
+        resize_dims = img_list[0].size  # (width, height)
+    elif resize_dims is None:
+        resize_dims = (512, 512)
     num_images = len(img_list)
     num_images_per_row = (num_images + 1) // 2  # Divide images into two rows, rounding up for the first row
     padded_width = resize_dims[0] + 2 * padding
     padded_height = resize_dims[1] + 2 * padding
     total_width = padded_width * num_images_per_row
     total_height = padded_height * 2  # Two rows
-    res = Image.new("RGB", (total_width, total_height), frame_color)    
+    res = Image.new("RGB", (total_width, total_height), frame_color)
     for i, img in enumerate(img_list):
         row = i // num_images_per_row
         col = i % num_images_per_row

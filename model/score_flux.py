@@ -163,86 +163,78 @@ class FluxScoreDistillation:
     ) -> torch.Tensor:
         """
         Compute score distillation gradient.
-        
+
         Uses Noise-Free Score Distillation (NFSD) approach adapted for Flux.
-        
+
         Args:
             latent: Input latent [B, C, H, W]
             prompt_embeds: Conditional text embeddings
             pooled_embeds: Pooled text embeddings
-            
+
         Returns:
             grad: Score gradient [B, C, H, W]
         """
         batch_size = latent.shape[0]
-        
+
+        # Process one sample at a time to minimize peak memory usage
+        # This is critical for large images on 24GB GPUs
+        if batch_size > 1:
+            grads = []
+            for i in range(batch_size):
+                lat_i = latent[i:i+1]
+                pe_i = prompt_embeds[i:i+1] if prompt_embeds.shape[0] > 1 else prompt_embeds
+                pool_i = pooled_embeds[i:i+1] if pooled_embeds.shape[0] > 1 else pooled_embeds
+                grad_i = self.grad_compute(lat_i, pe_i, pool_i)
+                grads.append(grad_i)
+                torch.cuda.empty_cache()
+            return torch.cat(grads, dim=0)
+
         # Expand embeddings for batch
         if prompt_embeds.shape[0] == 1:
             prompt_embeds = prompt_embeds.expand(batch_size, -1, -1)
             pooled_embeds = pooled_embeds.expand(batch_size, -1)
-        
-        embed_uncond = self.embed_uncond.expand(batch_size, -1, -1)
-        pooled_uncond = self.pooled_uncond.expand(batch_size, -1)
+
         embed_neg = self.embed_neg.expand(batch_size, -1, -1)
         pooled_neg = self.pooled_neg.expand(batch_size, -1)
-        
+
         # Prepare noised latent and timestep
         latent_t, t = self.grad_prepare(latent)
         latent_t = latent_t.to(dtype=self.dtype)
-        
-        grad_c = 0
-        grad_d = 0
-        
+
+        # Aggressive memory cleanup before transformer forward
+        torch.cuda.empty_cache()
+
         with torch.no_grad():  # No gradients needed for score computation
             with torch.autocast(device_type='cuda', dtype=self.dtype):
-                if self.grad_guidance_0 == self.grad_guidance_1:
-                    # Optimization: single forward pass difference
-                    # v_cond - v_neg gives direction toward conditional distribution
-                    v_cond = self.pipe.predict_velocity(
-                        latent_t, t, prompt_embeds, pooled_embeds, guidance_scale=1.0
-                    )
-                    grad_c = -v_cond.clone()
-                    del v_cond
-                    torch.cuda.empty_cache()
+                # Compute v_cond first, store result, free memory
+                v_cond = self.pipe.predict_velocity(
+                    latent_t, t, prompt_embeds, pooled_embeds, guidance_scale=1.0
+                )
+                grad_c = -v_cond.float()  # Convert to float32 immediately
+                del v_cond
+                torch.cuda.empty_cache()
 
-                    v_neg = self.pipe.predict_velocity(
-                        latent_t, t, embed_neg, pooled_neg, guidance_scale=1.0
-                    )
-                    grad_d = v_neg.clone()
-                    del v_neg
-                    torch.cuda.empty_cache()
-                else:
-                    # Full computation with unconditional baseline
-                    v_uncond = self.pipe.predict_velocity(
-                        latent_t, t, embed_uncond, pooled_uncond, guidance_scale=1.0
-                    )
+                # Now compute v_neg
+                v_neg = self.pipe.predict_velocity(
+                    latent_t, t, embed_neg, pooled_neg, guidance_scale=1.0
+                )
+                grad_d = v_neg.float()
+                del v_neg
+                torch.cuda.empty_cache()
 
-                    if self.grad_guidance_0 > 0:
-                        v_cond = self.pipe.predict_velocity(
-                            latent_t, t, prompt_embeds, pooled_embeds, guidance_scale=1.0
-                        )
-                        grad_c = v_uncond - v_cond  # Direction toward conditional
-                        del v_cond
-                        torch.cuda.empty_cache()
+        # Clean up intermediate tensors
+        del latent_t
+        torch.cuda.empty_cache()
 
-                    if self.grad_guidance_1 > 0:
-                        v_neg = self.pipe.predict_velocity(
-                            latent_t, t, embed_neg, pooled_neg, guidance_scale=1.0
-                        )
-                        grad_d = v_neg - v_uncond  # Direction away from negative
-                        del v_neg
-                        torch.cuda.empty_cache()
-
-                    del v_uncond
-                    torch.cuda.empty_cache()
-        
         # Weight and combine
         w = self.grad_weight(t).view(-1, 1, 1, 1)
         normalise = 1.0 / (abs(self.grad_guidance_0) + abs(self.grad_guidance_1))
-        
+
         grad = w * normalise * (self.grad_guidance_0 * grad_c + self.grad_guidance_1 * grad_d)
-        
-        return grad.float()  # Return in float32 for stability
+
+        del grad_c, grad_d
+
+        return grad  # Already float32
     
     def grad_compute_batch(
         self,
